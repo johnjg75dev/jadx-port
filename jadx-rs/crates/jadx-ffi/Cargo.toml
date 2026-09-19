@@ -1,0 +1,21 @@
+[package]
+name = "jadx-ffi"
+description = "C ABI exports (Windows DLL / Linux .so) for the jadx-rs decompiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "jadx"
+# cdylib -> jadx.dll / libjadx.so, staticlib -> for static linking,
+# rlib -> lets the Rust integration tests link against it directly.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+jadx-rs = { path = "../jadx-rs", default-features = false, features = ["dex", "zip"] }
+
+[features]
+default = []
