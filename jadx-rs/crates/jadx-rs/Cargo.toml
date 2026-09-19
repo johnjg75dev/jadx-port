@@ -1,0 +1,28 @@
+[package]
+name = "jadx-rs"
+description = "Java/Dalvik bytecode reader and decompiler, ported from jadx (pure Rust, no external crates)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["decompiler", "java", "bytecode", "jvm", "dex"]
+categories = ["development-tools::debugging", "parsing"]
+
+# Intentionally empty: this crate uses no external dependencies on purpose, so it
+# builds in air-gapped environments (only a Rust compiler is required) and can be
+# linked into a shared library without pulling in any transitive C code.
+# Everything jadx needs -- zip/inflate, class file reading, dex reading, IR and
+# code generation -- is implemented in-tree. See docs/PORTING.md.
+[dependencies]
+
+[lib]
+name = "jadx_rs"
+path = "src/lib.rs"
+
+[features]
+default = ["dex", "zip"]
+# Dalvik support: classes.dex / .dex reading and smali disassembly.
+dex = []
+# Read .class files out of zip/jar/aar/apk containers.
+zip = []

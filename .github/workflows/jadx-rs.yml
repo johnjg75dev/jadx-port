@@ -1,0 +1,178 @@
+# Builds and tests the Rust port (`jadx-rs/`) for every supported shared-library
+# target, and checks the two properties the design depends on:
+#
+#   1. `jadx-rs` uses no crates.io dependency (so it builds offline), and
+#   2. the hand-written `include/jadx.h` still matches the `extern "C"` exports.
+#
+# The Java build of the surrounding jadx clone is untouched: paths filter this
+# workflow to `jadx-rs/**`.
+
+name: jadx-rs
+
+on:
+  push:
+    paths:
+      - 'jadx-rs/**'
+      - '.github/workflows/jadx-rs.yml'
+  pull_request:
+    paths:
+      - 'jadx-rs/**'
+      - '.github/workflows/jadx-rs.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Format, clippy, no-dependency check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jadx-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      # `hard_tabs = true` in rustfmt.toml matches the source style; the check is
+      # advisory, so a formatting nit never hides a real compile error.
+      - name: Formatting
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features
+      - name: No external dependencies
+        # `cargo tree` must show only the workspace members; the whole point of the
+        # zero-dependency rule is that `cargo build --offline` works everywhere.
+        run: |
+          cargo tree --workspace --all-features -e normal,build | tee /tmp/tree.txt
+          if grep -E '^[^ ]+ v' /tmp/tree.txt | grep -v -E 'jadx-rs v|jadx-ffi v'; then
+            echo "found a crates.io dependency (marked lines above)"
+            exit 1
+          fi
+      - name: Offline build
+        run: cargo build --offline --all-features
+      - name: Generated dex table is up to date
+        run: |
+          python3 tools/gen_dex_table.py ../..
+          git diff --exit-color=never -- crates/jadx-rs/src/dex/table.rs 2>/dev/null || true
+          if ! git diff --quiet -- crates/jadx-rs/src/dex/table.rs; then
+            echo "crates/jadx-rs/src/dex/table.rs is stale: run jadx-rs/tools/gen_dex_table.py"
+            git diff -- crates/jadx-rs/src/dex/table.rs
+            exit 1
+          fi
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: jadx-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: cargo test
+        run: cargo test --workspace --all-features
+      - name: build the C ABI and try it from C
+        if: runner.os == 'Linux'
+        run: |
+          cargo build -p jadx-ffi --all-features
+          cargo run -p jadx-rs --example gen_class -- /tmp/T.class
+          cc -I crates/jadx-ffi/include -Wall -Wextra \
+             crates/jadx-ffi/examples/decompile.c -o /tmp/decompile \
+             -L target/debug -ljadx -Wl,-rpath,$GITHUB_WORKSPACE/jadx-rs/target/debug
+          /tmp/decompile /tmp/T.class | tee /tmp/out.txt
+          grep -q 'public class Generator' /tmp/out.txt
+          grep -q 'package com.example;' /tmp/out.txt
+      - name: and from python, through ctypes
+        if: runner.os == 'Linux'
+        run: |
+          JADX_LIB=$GITHUB_WORKSPACE/jadx-rs/target/debug/libjadx.so \
+            python3 crates/jadx-ffi/examples/decompile.py /tmp/T.class | tee /tmp/out2.txt
+          grep -q 'public class Generator' /tmp/out2.txt
+
+  shared-library:
+    name: Shared library artifacts (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    needs: [lint, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            base: libjadx.so
+          - name: windows-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            base: jadx.dll
+          - name: windows-gnu
+            os: windows-latest
+            target: x86_64-pc-windows-gnu
+            base: jadx.dll
+          - name: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            base: libjadx.so
+    defaults:
+      run:
+        working-directory: jadx-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      # the mingw build needs the gcc that ships with MSYS2, which the windows
+      # runner image already carries; only the path has to be on PATH
+      - name: PATH for x86_64-pc-windows-gnu
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        shell: bash
+        run: echo "C:/msys64/mingw64/bin" >> $GITHUB_PATH
+      - name: aarch64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> ~/.cargo/config.toml
+      - name: Build (debug)
+        run: cargo build -p jadx-ffi --target ${{ matrix.target }} --all-features
+      - name: Build (release)
+        run: cargo build -p jadx-ffi --target ${{ matrix.target }} --all-features --release
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for prof in debug release; do
+            src="target/${{ matrix.target }}/$prof"
+            if [ -f "$src/${{ matrix.base }}" ]; then
+              cp "$src/${{ matrix.base }}" "dist/${{ matrix.name }}-$prof-${{ matrix.base }}"
+            fi
+            if [ -f "$src/libjadx.a" ]; then
+              cp "$src/libjadx.a" "dist/${{ matrix.name }}-jadx-$prof.a"
+            fi
+            if [ -f "$src/jadx.dll.a" ]; then
+              cp "$src/jadx.dll.a" "dist/${{ matrix.name }}-jadx-$prof.dll.a"
+            fi
+            if [ -f "$src/jadx.lib" ]; then
+              cp "$src/jadx.lib" "dist/${{ matrix.name }}-jadx-$prof.lib"
+            fi
+          done
+          cp crates/jadx-ffi/include/jadx.h dist/jadx.h
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jadx-${{ matrix.name }}
+          path: jadx-rs/dist
+          if-no-files-found: error
